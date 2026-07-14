@@ -3650,7 +3650,7 @@ public static class AgcExports
         var address = state.IndexBufferAddress + byteOffset;
         return (ctx.Memory.TryRead(address, data) ||
                 KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, data))
-            ? new VulkanGuestIndexBuffer(data, is32Bit)
+            ? new VulkanGuestIndexBuffer(data, is32Bit, address)
             : null;
     }
 

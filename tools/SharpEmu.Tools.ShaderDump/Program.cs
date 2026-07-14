@@ -9,8 +9,8 @@
 // resulting vertex and compute SPIR-V blobs to disk. The blobs can then be
 // checked with spirv-val / spirv-dis.
 //
-// Programs that contain buffer_store_dword automatically get a single
-// global-memory binding covering every store, which the emitter exposes as
+// Programs that contain buffer instructions automatically get a single
+// global-memory binding covering every access, which the emitter exposes as
 // guestBuffers[0] (descriptor set 0, binding 0).
 //
 // Each program carries an expectation: ExpectTranslate=true programs must
@@ -77,6 +77,15 @@ const ulong ProgramAddress = 0x100000;
         0xE070000C, 0x80020200, // buffer_store_dword v2, off, s[8:11], 0 offset:12 (masked, must not land)
         0xBEFE03C1,             // s_mov_b32 exec_lo, -1      -> lane active again
         0xE0700010, 0x80020000, // buffer_store_dword v0, off, s[8:11], 0 offset:16
+        0xBF810000,             // s_endpgm
+    ]),
+    ("persistent-buffer-double", true, [
+        0xE0380000, 0x80020000, // buffer_load_dwordx4 v[0:3], off, s[8:11], 0
+        0x34000081,             // v_lshlrev_b32 v0, 1, v0
+        0x34020281,             // v_lshlrev_b32 v1, 1, v1
+        0x34040481,             // v_lshlrev_b32 v2, 1, v2
+        0x34060681,             // v_lshlrev_b32 v3, 1, v3
+        0xE0780000, 0x80020000, // buffer_store_dwordx4 v[0:3], off, s[8:11], 0
         0xBF810000,             // s_endpgm
     ]),
 ];
@@ -152,33 +161,33 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         continue;
     }
 
-    // Buffer stores need a global-memory binding; the emitter resolves them by
-    // instruction PC, so collect store PCs from the decoded program itself.
+    // Buffer accesses need a global-memory binding; the emitter resolves them by
+    // instruction PC, so collect their PCs from the decoded program itself.
     var programObj = decodeArgs[2]!;
     var instructions = (System.Collections.IEnumerable)programObj
         .GetType().GetProperty("Instructions")!.GetValue(programObj)!;
-    var storePcs = new List<uint>();
+    var bufferPcs = new List<uint>();
     foreach (var instruction in instructions)
     {
         var op = (string)instruction.GetType().GetProperty("Opcode")!.GetValue(instruction)!;
-        if (op.StartsWith("BufferStore", StringComparison.Ordinal))
+        if (op.StartsWith("Buffer", StringComparison.Ordinal))
         {
-            storePcs.Add((uint)instruction.GetType().GetProperty("Pc")!.GetValue(instruction)!);
+            bufferPcs.Add((uint)instruction.GetType().GetProperty("Pc")!.GetValue(instruction)!);
         }
     }
 
     // The binding's scalar base (8 -> s[8:11]) must match the srsrc field of
-    // the hand-assembled buffer_store words, and the 64-byte backing store
-    // must cover every hand-assembled store offset.
-    var globalBindings = Array.CreateInstance(globalBindingType, storePcs.Count > 0 ? 1 : 0);
-    if (storePcs.Count > 0)
+    // the hand-assembled buffer words, and the 64-byte backing store must cover
+    // every hand-assembled access offset.
+    var globalBindings = Array.CreateInstance(globalBindingType, bufferPcs.Count > 0 ? 1 : 0);
+    if (bufferPcs.Count > 0)
     {
         globalBindings.SetValue(
             Activator.CreateInstance(
                 globalBindingType,
                 8u,
                 0UL,
-                (IReadOnlyList<uint>)storePcs,
+                (IReadOnlyList<uint>)bufferPcs,
                 new byte[64]),
             0);
     }
@@ -201,7 +210,7 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         null,
         null)!;
 
-    object?[] compileArgs = [state, evaluation, null, null, 0, -1, 0];
+    object?[] compileArgs = [state, evaluation, null, null, 0, -1, 0, -1];
     if ((bool)tryCompile.Invoke(null, compileArgs)!)
     {
         var shader = compileArgs[2]!;
