@@ -5,6 +5,7 @@ using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Maths;
 using SharpEmu.Libs.Agc;
+using SharpEmu.HLE;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Vulkan.Extensions.EXT;
@@ -51,7 +52,8 @@ internal readonly record struct VulkanGuestSampler(
 internal sealed record VulkanGuestMemoryBuffer(
     ulong BaseAddress,
     byte[] Data,
-    GuestBufferAccess Access = GuestBufferAccess.ReadWrite);
+    GuestBufferAccess Access = GuestBufferAccess.ReadWrite,
+    ICpuMemory? GuestMemory = null);
 
 internal sealed record VulkanGuestVertexBuffer(
     uint Location,
@@ -151,6 +153,18 @@ internal sealed record VulkanComputeGuestDispatch(
     uint GroupCountY,
     uint GroupCountZ);
 
+internal sealed class VulkanGuestBufferFlushRequest(
+    ulong address,
+    ulong size)
+{
+    public ulong Address { get; } = address;
+    public ulong Size { get; } = size;
+    public ManualResetEventSlim Completion { get; } = new(false);
+    public bool Success { get; set; }
+    public Exception? Exception { get; set; }
+    public long Sequence { get; set; }
+}
+
 internal static unsafe class VulkanVideoPresenter
 {
     private const uint DefaultWindowWidth = 1280;
@@ -175,6 +189,8 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly Dictionary<ulong, uint> _gpuGuestImages = new();
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
+    private static readonly List<(ulong Address, ulong Size, long Sequence)>
+        _potentialGpuBufferWrites = [];
     private static Thread? _thread;
     private static Presentation? _latestPresentation;
     private static byte[]? _copyFragmentSpirv;
@@ -599,6 +615,45 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    internal static bool FlushGuestBufferWrites(ulong address, ulong size)
+    {
+        VulkanGuestBufferFlushRequest request;
+        lock (_gate)
+        {
+            if (!PotentialGpuWriteOverlaps(address, size))
+            {
+                return true;
+            }
+            if (_closed || _thread is null)
+            {
+                return false;
+            }
+
+            request = new VulkanGuestBufferFlushRequest(address, size);
+            EnqueueGuestWorkLocked(request);
+            request.Sequence = _enqueuedGuestWorkSequence;
+        }
+
+        request.Completion.Wait();
+        request.Completion.Dispose();
+        if (request.Exception is not null)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] vk.guest_buffer_readback_failed " +
+                $"addr=0x{address:X16} bytes={size}: {request.Exception.Message}");
+            return false;
+        }
+
+        if (request.Success)
+        {
+            lock (_gate)
+            {
+                RemovePotentialGpuWrite(address, size, request.Sequence);
+            }
+        }
+        return request.Success;
+    }
+
     public static bool TrySubmitGuestImage(
         ulong address,
         uint width,
@@ -853,6 +908,13 @@ internal static unsafe class VulkanVideoPresenter
             {
                 _closed = true;
                 _thread = null;
+                foreach (var flush in _pendingGuestWork.OfType<VulkanGuestBufferFlushRequest>())
+                {
+                    flush.Exception = new InvalidOperationException("Vulkan presenter stopped");
+                    flush.Completion.Set();
+                }
+                _pendingGuestWork.Clear();
+                _potentialGpuBufferWrites.Clear();
                 System.Threading.Monitor.PulseAll(_gate);
             }
         }
@@ -891,7 +953,78 @@ internal static unsafe class VulkanVideoPresenter
 
         _pendingGuestWork.Enqueue(work);
         _enqueuedGuestWorkSequence++;
+        TrackPotentialGpuWrites(work, _enqueuedGuestWorkSequence);
         System.Threading.Monitor.PulseAll(_gate);
+    }
+
+    private static void TrackPotentialGpuWrites(object work, long sequence)
+    {
+        var buffers = work switch
+        {
+            VulkanComputeGuestDispatch compute => compute.GlobalMemoryBuffers,
+            VulkanOffscreenGuestDraw draw => draw.Draw.GlobalMemoryBuffers,
+            _ => null,
+        };
+        if (buffers is null)
+        {
+            return;
+        }
+
+        TrackPotentialGpuWrites(buffers, sequence);
+    }
+
+    private static void TrackPotentialGpuWrites(
+        IEnumerable<VulkanGuestMemoryBuffer> buffers,
+        long sequence)
+    {
+        foreach (var buffer in buffers.Where(buffer =>
+            (buffer.Access & GuestBufferAccess.Write) != 0 &&
+            buffer.GuestMemory is not null &&
+            buffer.Data.Length != 0))
+        {
+            var size = (ulong)buffer.Data.Length;
+            var existingIndex = _potentialGpuBufferWrites.FindIndex(range =>
+                range.Address == buffer.BaseAddress && range.Size == size);
+            if (existingIndex >= 0)
+            {
+                _potentialGpuBufferWrites[existingIndex] =
+                    (buffer.BaseAddress, size, sequence);
+            }
+            else
+            {
+                _potentialGpuBufferWrites.Add((buffer.BaseAddress, size, sequence));
+            }
+        }
+    }
+
+    private static bool PotentialGpuWriteOverlaps(ulong address, ulong size)
+    {
+        var end = checked(address + size);
+        return _potentialGpuBufferWrites.Any(range =>
+            address < checked(range.Address + range.Size) && range.Address < end);
+    }
+
+    private static void RemovePotentialGpuWrite(ulong address, ulong size, long sequence)
+    {
+        var end = checked(address + size);
+        foreach (var range in _potentialGpuBufferWrites.ToArray())
+        {
+            var rangeEnd = checked(range.Address + range.Size);
+            if (range.Sequence > sequence || address >= rangeEnd || range.Address >= end)
+            {
+                continue;
+            }
+            _potentialGpuBufferWrites.Remove(range);
+            if (range.Address < address)
+            {
+                _potentialGpuBufferWrites.Add(
+                    (range.Address, address - range.Address, range.Sequence));
+            }
+            if (end < rangeEnd)
+            {
+                _potentialGpuBufferWrites.Add((end, rangeEnd - end, range.Sequence));
+            }
+        }
     }
 
     private static bool TryTakeGuestWork(out object work)
@@ -2046,6 +2179,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 MarkSampledImagesInitialized(_pendingPresentationResources);
                 MarkStorageImagesInitialized(_pendingPresentationResources);
+                MarkGuestBufferWrites(_pendingPresentationResources);
                 DestroyTranslatedDrawResources(_pendingPresentationResources);
                 _pendingPresentationResources = null;
             }
@@ -2183,6 +2317,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 TraceGuestBufferContents(submission.Resources);
+                MarkGuestBufferWrites(submission.Resources);
                 DestroyTranslatedDrawResources(submission.Resources);
                 _completedGuestBufferSubmission = Math.Max(
                     _completedGuestBufferSubmission,
@@ -3898,7 +4033,8 @@ internal static unsafe class VulkanVideoPresenter
                 guestBuffer.Data,
                 GuestBufferUsage.Storage,
                 guestBuffer.Access,
-                submission);
+                submission,
+                guestBuffer.GuestMemory);
 
             if (ShouldTraceVulkanResources() &&
                 _tracedGlobalBuffers.Add((guestBuffer.BaseAddress, guestBuffer.Data.Length)))
@@ -4594,6 +4730,23 @@ internal static unsafe class VulkanVideoPresenter
             while (_pendingGuestSubmissions.Count != 0)
             {
                 CollectCompletedGuestSubmissions(waitForOldest: true);
+            }
+        }
+
+        private bool FlushGuestBufferWrites(ulong address, ulong size)
+        {
+            WaitForGuestBuffersIdle();
+            return _guestBufferCache.FlushGpuWrites(address, size);
+        }
+
+        private void MarkGuestBufferWrites(TranslatedDrawResources resources)
+        {
+            foreach (var binding in resources.GlobalMemoryBuffers
+                .Where(resource => resource is not null)
+                .Select(resource => resource.Binding)
+                .Distinct())
+            {
+                _guestBufferCache.MarkGpuWritten(binding);
             }
         }
 
@@ -5744,6 +5897,20 @@ internal static unsafe class VulkanVideoPresenter
                             break;
                         case VulkanComputeGuestDispatch computeDispatch:
                             ExecuteComputeDispatch(computeDispatch);
+                            break;
+                        case VulkanGuestBufferFlushRequest flush:
+                            try
+                            {
+                                flush.Success = FlushGuestBufferWrites(flush.Address, flush.Size);
+                            }
+                            catch (Exception exception)
+                            {
+                                flush.Exception = exception;
+                            }
+                            finally
+                            {
+                                flush.Completion.Set();
+                            }
                             break;
                     }
                 }

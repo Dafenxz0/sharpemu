@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Ampr;
+using SharpEmu.Libs.VideoOut;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
@@ -3287,6 +3288,7 @@ public static class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        _ = VulkanVideoPresenter.FlushGuestBufferWrites(address, length);
         lock (_memoryGate)
         {
             if (!_mappedRegions.TryGetValue(address, out var mappedRegion) || mappedRegion.Length != length)

@@ -2510,6 +2510,9 @@ public static class AgcExports
         {
             var woken = GpuWaitRegistry.CollectSatisfied((address, is64Bit) =>
             {
+                _ = VulkanVideoPresenter.FlushGuestBufferWrites(
+                    address,
+                    is64Bit ? (ulong)sizeof(ulong) : sizeof(uint));
                 if (is64Bit)
                 {
                     return ctx.TryReadUInt64(address, out var value64)
@@ -2702,6 +2705,9 @@ public static class AgcExports
                 if (TryParseWaitRegMem(ctx, currentAddress, register == RWaitMem64,
                         out var waitAddr, out var refVal, out var waitMask, out var cmpFunc))
                 {
+                    _ = VulkanVideoPresenter.FlushGuestBufferWrites(
+                        waitAddr,
+                        register == RWaitMem64 ? (ulong)sizeof(ulong) : sizeof(uint));
                     ulong curVal = 0;
                     bool hasCurVal;
                     if (register == RWaitMem64)
@@ -2750,7 +2756,7 @@ public static class AgcExports
             {
                 if (TryParseStandardWaitRegMem(ctx, currentAddress,
                         out var waitAddr, out var refVal, out var waitMask, out var cmpFunc) &&
-                    ctx.TryReadUInt32(waitAddr, out var curVal))
+                    FlushGuestBufferAndReadUInt32(ctx, waitAddr, out var curVal))
                 {
                     var waiter = new GpuWaitRegistry.WaitingDcb
                     {
@@ -2876,7 +2882,7 @@ public static class AgcExports
                         "draw-fallback");
                     var textures = CreateVulkanGuestDrawTextures(ctx, translatedDraw.Textures, out var fallbackTextureCount);
                     var globalMemoryBuffers =
-                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                        CreateVulkanGuestMemoryBuffers(ctx, translatedDraw.GlobalMemoryBindings);
                     VulkanVideoPresenter.SubmitTranslatedDraw(
                         translatedDraw.PixelSpirv,
                         textures,
@@ -3321,7 +3327,7 @@ public static class AgcExports
                     translatedDraw.Textures,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                    CreateVulkanGuestMemoryBuffers(ctx, translatedDraw.GlobalMemoryBindings);
                 var vertexBuffers =
                     CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
                 VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
@@ -3354,7 +3360,7 @@ public static class AgcExports
                         translatedDraw.Textures,
                         out _);
                     var globalMemoryBuffers =
-                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                        CreateVulkanGuestMemoryBuffers(ctx, translatedDraw.GlobalMemoryBindings);
                     VulkanVideoPresenter.SubmitStorageTranslatedDraw(
                         translatedDraw.PixelSpirv,
                         textures,
@@ -4201,6 +4207,7 @@ public static class AgcExports
     }
 
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(
+        CpuContext ctx,
         IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
     {
         var buffers = new VulkanGuestMemoryBuffer[bindings.Count];
@@ -4208,7 +4215,11 @@ public static class AgcExports
         {
             buffers[index] = new VulkanGuestMemoryBuffer(
                 bindings[index].BaseAddress,
-                bindings[index].Data);
+                bindings[index].Data,
+                bindings[index].MayWrite
+                    ? GuestBufferAccess.ReadWrite
+                    : GuestBufferAccess.Read,
+                ctx.Memory);
         }
 
         return buffers;
@@ -4660,7 +4671,7 @@ public static class AgcExports
                     translatedBindings,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
+                    CreateVulkanGuestMemoryBuffers(ctx, evaluation.GlobalMemoryBindings);
                 VulkanVideoPresenter.SubmitComputeDispatch(
                     shaderAddress,
                     computeSpirv,
@@ -6145,6 +6156,15 @@ public static class AgcExports
     // 32-bit (ItNop/RWaitMem32): +4 addrLo, +8 addrHi, +12 mask, +16 cmp|op<<8, +20 ref.
     // 64-bit (ItNop/RWaitMem64): +4 addrLo, +8 addrHi, +12 maskLo, +16 maskHi,
     //                            +20 refLo, +24 refHi, +28 cmp|op<<8, +32 poll.
+    private static bool FlushGuestBufferAndReadUInt32(
+        CpuContext ctx,
+        ulong address,
+        out uint value)
+    {
+        _ = VulkanVideoPresenter.FlushGuestBufferWrites(address, sizeof(uint));
+        return ctx.TryReadUInt32(address, out value);
+    }
+
     private static bool TryParseWaitRegMem(
         CpuContext ctx,
         ulong addr,

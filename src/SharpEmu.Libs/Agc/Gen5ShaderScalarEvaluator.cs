@@ -219,6 +219,7 @@ internal static class Gen5ShaderScalarEvaluator
                     {
                         instructionPcs.Add(instruction.Pc);
                     }
+                    existingBinding.MayWrite |= MayWriteGlobalMemory(instruction.Opcode);
                 }
                 else
                 {
@@ -235,7 +236,10 @@ internal static class Gen5ShaderScalarEvaluator
                         globalMemory.ScalarAddress,
                         baseAddress,
                         new List<uint> { instruction.Pc },
-                        data);
+                        data)
+                    {
+                        MayWrite = MayWriteGlobalMemory(instruction.Opcode),
+                    };
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }
@@ -332,6 +336,7 @@ internal static class Gen5ShaderScalarEvaluator
                     {
                         instructionPcs.Add(instruction.Pc);
                     }
+                    existingBinding.MayWrite |= MayWriteGlobalMemory(instruction.Opcode);
                 }
                 else
                 {
@@ -358,7 +363,10 @@ internal static class Gen5ShaderScalarEvaluator
                         bufferMemory.ScalarResource,
                         bufferDescriptor.BaseAddress,
                         new List<uint> { instruction.Pc },
-                        data);
+                        data)
+                    {
+                        MayWrite = MayWriteGlobalMemory(instruction.Opcode),
+                    };
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }
@@ -1353,6 +1361,10 @@ internal static class Gen5ShaderScalarEvaluator
 
         return true;
     }
+
+    private static bool MayWriteGlobalMemory(string opcode) =>
+        opcode.Contains("Store", StringComparison.Ordinal) ||
+        opcode.Contains("Atomic", StringComparison.Ordinal);
 
     private static bool TryExecuteScalarLoad(
         CpuContext ctx,
